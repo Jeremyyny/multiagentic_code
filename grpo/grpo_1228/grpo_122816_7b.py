@@ -11,6 +11,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
 import wandb
 
+try:
+    import trl.extras.profiling as trl_profiling
+    trl_profiling.wandb = wandb
+except Exception:
+    # 如果未来版本已经修了，这里就安静跳过
+    pass
+
 # =========================
 # 全局随机种子
 # =========================
@@ -23,8 +30,8 @@ torch.cuda.manual_seed_all(SEED)
 # =========================
 # 配置
 # =========================
-MANAGER_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-REASONING_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"  # ✅ 改：reasoning 用冻结 7B
+MANAGER_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+REASONING_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"  # ✅ 改：reasoning 用冻结 7B
 
 DATA_PATH = "golden_dataset_pubmedqa_qwen2.5_pro_test_500.json"
 SAVE_PATH = "grpo_manager_pubmedqa_explicit_12281438"
@@ -312,8 +319,8 @@ def main():
     wandb.login(key="422b2738db53806489567fb2db277d201112125e")
 
     wandb.init(
-        project="pubmedqa-grpo",
-        name="manager_reasoning_bf16_0.5B",
+        project="pubmedqa-grpo_1",
+        name="manager_reasoning_bf16_0.5B_1",
         config={
             "manager_model": MANAGER_MODEL_NAME,
             "reasoning_model": REASONING_MODEL_NAME,
@@ -340,6 +347,7 @@ def main():
         bf16=(DEVICE == "cuda"),
         beta=0.01,
         scale_rewards="group",
+        report_to=["wandb"],
     )
 
     trainer = GRPOTrainer(
