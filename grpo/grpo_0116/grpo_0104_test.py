@@ -25,14 +25,14 @@ if torch.cuda.is_available():
 # -----------------------------
 # Config
 # -----------------------------
-MANAGER_MODEL = "Qwen/Qwen3-0.6B"
+MANAGER_MODEL = "Qwen/Qwen3-8B"
 DATA_PATH = "golden_dataset_pubmedqa_qwen2.5_pro_test_500.json"
 SAVE_PATH = "grpo_manager_qwen3_tools_optional_tool_v2"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_FROZEN_REASONER = True
-REASONER_MODEL = "Qwen/Qwen3-0.6B"
+REASONER_MODEL = "Qwen/Qwen3-8B"
 REASONER_DEVICE = "cpu"
 REASONER_MAX_NEW_TOKENS = 1024
 
@@ -172,7 +172,7 @@ if USE_FROZEN_REASONER:
 # -----------------------------
 
 PRINT_TOOL_OUTPUT = True
-TOOL_OUTPUT_MAX_CHARS = None # None 表示不截断
+TOOL_OUTPUT_MAX_CHARS = 2500  # None 表示不截断
 
 def _truncate(text: str, limit: int | None) -> str:
     if limit is None or len(text) <= limit:
@@ -202,8 +202,7 @@ def reasoning_tool(example_id: int) -> str:
     q = ex["question"]
     ctx = ex["context"]
 
-    sents = re.split(r"(?<=[.!?])\s+", ctx.strip())
-    tail = " ".join([s for s in sents[-2:] if s]) if sents else ""
+    tail = ctx.strip()
 
     reasoner_out = ""
     if _reasoner is not None:
@@ -237,7 +236,7 @@ def preprocess(example: Dict[str, Any]) -> Dict[str, Any]:
     eid = int(example["example_id"])
     msgs = build_messages(eid, example["question"], example["context"])
     return {
-        "prompt": msgs,                      # ✅ conversational prompt
+        "prompt": msgs,                      
         "ground_truth": example["ground_truth"],
         "example_id": eid,
     }
