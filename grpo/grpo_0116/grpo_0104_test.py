@@ -25,16 +25,16 @@ if torch.cuda.is_available():
 # -----------------------------
 # Config
 # -----------------------------
-MANAGER_MODEL = "Qwen/Qwen3-8B"
+MANAGER_MODEL = "Qwen/Qwen3-0.6B"
 DATA_PATH = "golden_dataset_pubmedqa_qwen2.5_pro_test_500.json"
-SAVE_PATH = "grpo_manager_qwen3_tools_optional_tool_v1"
+SAVE_PATH = "grpo_manager_qwen3_tools_optional_tool_v2"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_FROZEN_REASONER = True
-REASONER_MODEL = "Qwen/Qwen3-8B"
+REASONER_MODEL = "Qwen/Qwen3-0.6B"
 REASONER_DEVICE = "cpu"
-REASONER_MAX_NEW_TOKENS = 512 
+REASONER_MAX_NEW_TOKENS = 1024
 
 # Optional: encourage/discourage tool usage.
 TOOL_PENALTY = 0.0  # penalty if tool used; set to 0.0 to disable
@@ -67,7 +67,6 @@ SYSTEM_PROMPT = (
     "Do NOT output <think>.\n"
 )
 
-# 只从“最后一行”解析，避免 tool 输出里出现 ANSWER_ 干扰
 ANSWER_LASTLINE_RE = re.compile(r"(?:^|\n)\s*ANSWER_(YES|NO|MAYBE)\s*$", re.IGNORECASE)
 
 def parse_answer_label_lastline(text: str) -> Optional[str]:
@@ -118,7 +117,7 @@ def load_data(path: str) -> Dataset:
 class FrozenReasoner:
     model_name: str
     device: str = "cpu"
-    max_new_tokens: int = 96
+    max_new_tokens: int = 512
 
     def __post_init__(self):
         self.tok = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
@@ -140,13 +139,11 @@ class FrozenReasoner:
     def infer(self, question: str, context: str) -> str:
         sys = (
             "You are a clinical reasoning assistant.\n"
-            "Given a PubMed abstract and a question, decide YES/NO/MAYBE.\n"
-            "Return two lines:\n"
-            "1) PRED: YES/NO/MAYBE\n"
-            "2) One short justification sentence.\n"
+            "Given a clinical question and corresponding context.\n"
+            "Return step by step reasoning.\n"
             "Do NOT output <think>.\n"
         )
-        user = f"Question:\n{question}\n\nAbstract:\n{context}\n"
+        user = f"Question:\n{question}\n\nContext:\n{context}\n"
         messages = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
 
         try:
@@ -175,7 +172,7 @@ if USE_FROZEN_REASONER:
 # -----------------------------
 
 PRINT_TOOL_OUTPUT = True
-TOOL_OUTPUT_MAX_CHARS = 1200  # None 表示不截断
+TOOL_OUTPUT_MAX_CHARS = None # None 表示不截断
 
 def _truncate(text: str, limit: int | None) -> str:
     if limit is None or len(text) <= limit:
@@ -326,8 +323,8 @@ def main():
     grpo_args = GRPOConfig(
         output_dir=SAVE_PATH,
         remove_unused_columns=False,
-        max_completion_length=256,
-        temperature=0.9,
+        max_completion_length=1024,
+        temperature=0.7,
         num_generations=4,
         bf16=(DEVICE == "cuda"),
         beta=0.0,
