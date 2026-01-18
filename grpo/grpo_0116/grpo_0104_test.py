@@ -3,13 +3,14 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
+from trl.chat_template_utils import add_response_schema, parse_response
 from transformers.utils.chat_template_utils import get_json_schema
 
 # -----------------------------
@@ -23,23 +24,30 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # -----------------------------
-# Config
+# Config (keep your values)
 # -----------------------------
-MANAGER_MODEL = "Qwen/Qwen3-8B"
+MANAGER_MODEL = "Qwen/Qwen3-0.6B"
 DATA_PATH = "golden_dataset_pubmedqa_qwen2.5_pro_test_500.json"
 SAVE_PATH = "grpo_manager_qwen3_tools_optional_tool_v2"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_FROZEN_REASONER = True
-REASONER_MODEL = "Qwen/Qwen3-8B"
+REASONER_MODEL = "Qwen/Qwen3-0.6B"
 REASONER_DEVICE = "cpu"
-REASONER_MAX_NEW_TOKENS = 1024
+REASONER_MAX_NEW_TOKENS = 512
 
-# Optional: encourage/discourage tool usage.
-TOOL_PENALTY = 0.0  # penalty if tool used; set to 0.0 to disable
-TOOL_CALL_BONUS = 0.05  # reward for using tool; set to 0.0 to disable
-TOOL_BONUS_ONLY_IF_CORRECT = True  # only add bonus when final answer is correct
+# Optional: encourage/discourage tool usage (keep your values)
+TOOL_PENALTY = 0.0
+TOOL_CALL_BONUS = 0.05
+TOOL_BONUS_ONLY_IF_CORRECT = True
+
+# Added (default 0.0 to keep behavior stable unless you turn it on)
+NO_TOOL_CORRECT_BONUS = 0.0
+
+# Debug log (added)
+DEBUG_JSONL = SAVE_PATH + "_train_debug.jsonl"
+DEBUG_MAX_CHARS = 400
 
 # -----------------------------
 # Global caches
@@ -48,7 +56,7 @@ ID2EX: Dict[int, Dict[str, Any]] = {}
 TOOL_CACHE: Dict[int, str] = {}
 
 # -----------------------------
-# Prompt
+# Prompt (unchanged)
 # -----------------------------
 SYSTEM_PROMPT = (
     "You are a manager agent solving PubMedQA-style clinical questions.\n"
@@ -125,10 +133,12 @@ class FrozenReasoner:
             self.tok.pad_token_id = self.tok.eos_token_id
         self.tok.padding_side = "left"
 
-        dtype = torch.float32 if self.device == "cpu" else (torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+        dtype = torch.float32 if self.device == "cpu" else (
+            torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        )
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            dtype=dtype,
+            torch_dtype=dtype,
             trust_remote_code=True,
         ).to(self.device)
         self.model.eval()
@@ -147,7 +157,9 @@ class FrozenReasoner:
         messages = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
 
         try:
-            prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            prompt = self.tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
         except TypeError:
             prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -168,17 +180,15 @@ if USE_FROZEN_REASONER:
     _reasoner = FrozenReasoner(REASONER_MODEL, REASONER_DEVICE, REASONER_MAX_NEW_TOKENS)
 
 # -----------------------------
-# Tool function (used by TRL tools)
+# Tool function
 # -----------------------------
-
 PRINT_TOOL_OUTPUT = True
-TOOL_OUTPUT_MAX_CHARS = 2500  # None 表示不截断
+TOOL_OUTPUT_MAX_CHARS = 1200
 
-def _truncate(text: str, limit: int | None) -> str:
+def _truncate(text: str, limit: Optional[int]) -> str:
     if limit is None or len(text) <= limit:
         return text
     return text[:limit] + "...[truncated]"
-
 
 def reasoning_tool(example_id: int) -> str:
     """Return an expert report for a PubMedQA example.
@@ -218,31 +228,36 @@ def reasoning_tool(example_id: int) -> str:
     )
     if PRINT_TOOL_OUTPUT:
         print(f"\n[TOOL] example_id={eid}\n{_truncate(out, TOOL_OUTPUT_MAX_CHARS)}\n")
-        
+
     TOOL_CACHE[eid] = out
     return out
 
-
-
 # -----------------------------
-# Manager tokenizer
+# Manager tokenizer (added schema)
 # -----------------------------
 manager_tok = AutoTokenizer.from_pretrained(MANAGER_MODEL, trust_remote_code=True)
 manager_tok.padding_side = "left"
 if manager_tok.pad_token_id is None and manager_tok.eos_token_id is not None:
     manager_tok.pad_token_id = manager_tok.eos_token_id
 
+# Added: make tool-calls / structured parsing consistent
+try:
+    manager_tok = add_response_schema(manager_tok)
+except ValueError:
+    # already has schema
+    pass
+
 def preprocess(example: Dict[str, Any]) -> Dict[str, Any]:
     eid = int(example["example_id"])
     msgs = build_messages(eid, example["question"], example["context"])
     return {
-        "prompt": msgs,                      
+        "prompt": msgs,
         "ground_truth": example["ground_truth"],
         "example_id": eid,
     }
 
 # -----------------------------
-# Reward
+# Reward helpers (improved parsing + phase checks + debug)
 # -----------------------------
 def _ensure_len(x: Any, n: int) -> List[Any]:
     if isinstance(x, list):
@@ -259,83 +274,189 @@ def _ensure_len(x: Any, n: int) -> List[Any]:
         return (x * ((n // len(x)) + 1))[:n]
     return [x] * n
 
-def _last_assistant_text(completion: Any) -> str:
-    # conversational completion: list[dict]
-    if isinstance(completion, list):
-        for msg in reversed(completion):
-            if isinstance(msg, dict) and msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                return "" if content is None else str(content)
-        return ""
-    # sometimes dict
-    if isinstance(completion, dict):
-        content = completion.get("content", "")
-        return "" if content is None else str(content)
-    # fallback
-    return "" if completion is None else str(completion)
+def _extract_first_and_last_assistant(completion_msgs: Any) -> (str, str, bool, bool):
+    """
+    Returns:
+      first_assistant_text, last_assistant_text, any_tool_msg, any_tool_calls_struct
+    """
+    first = ""
+    last = ""
+    any_tool_msg = False
+    any_tool_calls_struct = False
 
-def _used_tool(completion: Any) -> bool:
-    if isinstance(completion, list):
-        for msg in completion:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") == "tool":
-                return True
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                return True
+    if not isinstance(completion_msgs, list):
+        # fallback: treat as plain text
+        txt = "" if completion_msgs is None else str(completion_msgs)
+        return txt, txt, False, False
+
+    for msg in completion_msgs:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "tool":
+            any_tool_msg = True
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            any_tool_calls_struct = True
+
+    for msg in completion_msgs:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            first = "" if msg.get("content") is None else str(msg.get("content"))
+            break
+    for msg in reversed(completion_msgs):
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            last = "" if msg.get("content") is None else str(msg.get("content"))
+            break
+
+    return first, last, any_tool_msg, any_tool_calls_struct
+
+def _final_has_tool_call_artifacts(last_text: str) -> bool:
+    if not last_text:
+        return False
+    # catch common patterns, even if schema parsing misses it
+    if "<tool_call>" in last_text:
+        return True
+    if '"name"' in last_text and "reasoning_tool" in last_text and "arguments" in last_text:
+        return True
     return False
 
-def accuracy_reward(prompts=None, completions=None, ground_truth=None, example_id=None, **kwargs):
+def _write_debug_row(row: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(DEBUG_JSONL) or ".", exist_ok=True)
+    with open(DEBUG_JSONL, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+# -----------------------------
+# Reward 1: accuracy + your tool bonus/penalty logic (kept)
+# -----------------------------
+def accuracy_reward(
+    prompts=None,
+    completions=None,
+    completion_ids=None,
+    ground_truth=None,
+    example_id=None,
+    **kwargs
+):
     n = len(completions)
     gts = _ensure_len(ground_truth, n)
 
     rewards = []
     for c, gt in zip(completions, gts):
         gt = (gt or "").strip().lower()
-        text = _last_assistant_text(c)
-        pred = parse_answer_label_lastline(text)
+
+        first_text, last_text, any_tool_msg, any_tool_calls_struct = _extract_first_and_last_assistant(c)
+        pred = parse_answer_label_lastline(last_text)
+
         is_correct = pred is not None and pred == gt
         r = 1.0 if is_correct else 0.0
 
-        used_tool = _used_tool(c)
+        used_tool = any_tool_msg or any_tool_calls_struct or _final_has_tool_call_artifacts(last_text)
         if TOOL_PENALTY > 0.0 and used_tool:
             r -= TOOL_PENALTY
 
         if TOOL_CALL_BONUS > 0.0 and used_tool and (is_correct or not TOOL_BONUS_ONLY_IF_CORRECT):
             r += TOOL_CALL_BONUS
 
-        rewards.append(r)
+        if NO_TOOL_CORRECT_BONUS > 0.0 and (not used_tool) and is_correct:
+            r += NO_TOOL_CORRECT_BONUS
+
+        rewards.append(float(r))
     return rewards
 
 # -----------------------------
-# Main
+# Reward 2: format reward (added)
 # -----------------------------
+def format_reward(prompts=None, completions=None, **kwargs):
+    rewards = []
+    for c in completions:
+        _, last_text, _, _ = _extract_first_and_last_assistant(c)
+        ok = parse_answer_label_lastline(last_text) is not None
+        # small shaping reward to push parseable outputs
+        rewards.append(0.2 if ok else 0.0)
+    return rewards
 
-from transformers.utils.chat_template_utils import get_json_schema
+# -----------------------------
+# Reward 3: phase reward (added)
+# Enforce: if tool used, first assistant should NOT contain ANSWER_*,
+# and final assistant should contain ANSWER_* and should NOT contain tool call artifacts.
+# -----------------------------
+def phase_reward(prompts=None, completions=None, **kwargs):
+    rewards = []
+    for c in completions:
+        first_text, last_text, any_tool_msg, any_tool_calls_struct = _extract_first_and_last_assistant(c)
+        used_tool = any_tool_msg  # tool loop creates role=tool when actually executed
 
+        first_has_answer = parse_answer_label_lastline(first_text) is not None
+        final_has_answer = parse_answer_label_lastline(last_text) is not None
+        final_has_tool_artifacts = any_tool_calls_struct or _final_has_tool_call_artifacts(last_text)
+
+        r = 0.0
+        if used_tool:
+            if first_has_answer:
+                r -= 0.3
+            if (not final_has_answer):
+                r -= 0.3
+            if final_has_tool_artifacts:
+                # this is the big one: prevents "tool again" after tool output
+                r -= 0.4
+        else:
+            # no tool: must still end with ANSWER_*
+            if not final_has_answer:
+                r -= 0.2
+
+        rewards.append(float(r))
+    return rewards
+
+# -----------------------------
+# Reward 4: debug hook (added, neutral)
+# -----------------------------
+def debug_reward(prompts=None, completions=None, ground_truth=None, example_id=None, **kwargs):
+    n = len(completions)
+    exids = _ensure_len(example_id, n)
+    gts = _ensure_len(ground_truth, n)
+
+    for c, eid, gt in zip(completions, exids, gts):
+        first_text, last_text, any_tool_msg, any_tool_calls_struct = _extract_first_and_last_assistant(c)
+        pred = parse_answer_label_lastline(last_text)
+        row = {
+            "example_id": int(eid) if eid is not None else None,
+            "ground_truth": (gt or "").strip().lower(),
+            "pred": pred,
+            "used_tool_msg": bool(any_tool_msg),
+            "used_tool_calls_struct": bool(any_tool_calls_struct),
+            "first_assistant": (first_text[:DEBUG_MAX_CHARS] if first_text else ""),
+            "last_assistant": (last_text[:DEBUG_MAX_CHARS] if last_text else ""),
+        }
+        _write_debug_row(row)
+
+    return [0.0] * n
+
+# -----------------------------
+# Main (keep your GRPOConfig values)
+# -----------------------------
 def main():
     dataset = load_data(DATA_PATH)
     splits = dataset.train_test_split(test_size=0.2, seed=SEED, shuffle=True)
 
     train_dataset = splits["train"].map(preprocess, remove_columns=splits["train"].column_names)
+
+    # keep your schema print
     print(get_json_schema(reasoning_tool))
+
     grpo_args = GRPOConfig(
         output_dir=SAVE_PATH,
         remove_unused_columns=False,
-        max_completion_length=1024,
+        max_completion_length=512,
         temperature=0.7,
         num_generations=4,
         bf16=(DEVICE == "cuda"),
         beta=0.0,
         scale_rewards="group",
         report_to=[],
-        use_vllm=False,  # ✅ 不需要 vLLM
+        use_vllm=False,
         per_device_train_batch_size=4,
-        max_tool_calling_iterations=1,  # ✅ 你这个任务基本只需要一次 tool call
-        chat_template_kwargs={"enable_thinking": False},  # ✅ Qwen3 避免<think>
+        max_tool_calling_iterations=1,
+        chat_template_kwargs={"enable_thinking": False},
         logging_steps=1,
         log_completions=True,
-        num_completions_to_print=None,  # None = 全部打印当前 batch
+        num_completions_to_print=None,
         log_unique_prompts=False,
     )
 
@@ -343,16 +464,18 @@ def main():
         model=MANAGER_MODEL,
         args=grpo_args,
         train_dataset=train_dataset,
-        reward_funcs=[accuracy_reward],
         processing_class=manager_tok,
-        tools=[reasoning_tool],   # ✅ 关键：启用 TRL 内置 tools 流程
-        rollout_func=None,        # ✅ 不再需要 rollout_func
+        tools=[reasoning_tool],
+        # added shaping rewards + debug
+        reward_funcs=[accuracy_reward, format_reward, phase_reward, debug_reward],
+        rollout_func=None,  # kept as you had
     )
 
     trainer.train()
     trainer.model.save_pretrained(SAVE_PATH)
     manager_tok.save_pretrained(SAVE_PATH)
     print(f"Saved model to {SAVE_PATH}")
+    print(f"Debug log written to {DEBUG_JSONL}")
 
 if __name__ == "__main__":
     main()
