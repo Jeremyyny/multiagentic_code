@@ -31,12 +31,12 @@ EVAL_SAVE_PATH = "grpo_eval_with_tools_seed42_v2.json"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_FROZEN_REASONER = True
-REASONER_MODEL = "Qwen/Qwen3-0.6B"
-REASONER_DEVICE = "cpu"
-REASONER_MAX_NEW_TOKENS = 1024
+REASONER_MODEL = "Qwen/Qwen3-8B"
+REASONER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+REASONER_MAX_NEW_TOKENS = 2048
 
 MAX_TOOL_CALLING_ITERATIONS = 1
-MAX_COMPLETION_LENGTH = 1024
+MAX_COMPLETION_LENGTH = 2048
 
 # Generation settings
 DO_SAMPLE = False

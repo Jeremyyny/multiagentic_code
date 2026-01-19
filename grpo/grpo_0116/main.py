@@ -34,12 +34,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_FROZEN_REASONER = True
 REASONER_MODEL = "Qwen/Qwen3-0.6B"
-REASONER_DEVICE = "cpu"
-REASONER_MAX_NEW_TOKENS = 512
+REASONER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+REASONER_MAX_NEW_TOKENS = 2048
 
 # Optional: encourage/discourage tool usage (keep your values)
 TOOL_PENALTY = 0.0
-TOOL_CALL_BONUS = 0.05
+TOOL_CALL_BONUS = 0.3
 TOOL_BONUS_ONLY_IF_CORRECT = True
 
 # Added (default 0.0 to keep behavior stable unless you turn it on)
@@ -47,7 +47,7 @@ NO_TOOL_CORRECT_BONUS = 0.0
 
 # Debug log (added)
 DEBUG_JSONL = SAVE_PATH + "_train_debug.jsonl"
-DEBUG_MAX_CHARS = 400
+DEBUG_MAX_CHARS = 2048
 
 # -----------------------------
 # Global caches
@@ -125,7 +125,7 @@ def load_data(path: str) -> Dataset:
 class FrozenReasoner:
     model_name: str
     device: str = "cpu"
-    max_new_tokens: int = 512
+    max_new_tokens: int = 2048
 
     def __post_init__(self):
         self.tok = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
@@ -183,7 +183,7 @@ if USE_FROZEN_REASONER:
 # Tool function
 # -----------------------------
 PRINT_TOOL_OUTPUT = True
-TOOL_OUTPUT_MAX_CHARS = 1200
+TOOL_OUTPUT_MAX_CHARS = 2048
 
 def _truncate(text: str, limit: Optional[int]) -> str:
     if limit is None or len(text) <= limit:
@@ -443,7 +443,7 @@ def main():
     grpo_args = GRPOConfig(
         output_dir=SAVE_PATH,
         remove_unused_columns=False,
-        max_completion_length=512,
+        max_completion_length=2048,
         temperature=0.7,
         num_generations=4,
         bf16=(DEVICE == "cuda"),
