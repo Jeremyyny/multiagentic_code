@@ -27,19 +27,19 @@ if torch.cuda.is_available():
 # Config (keep your values)
 # -----------------------------
 MANAGER_MODEL = "Qwen/Qwen3-0.6B"
-DATA_PATH = "golden_dataset_pubmedqa_qwen2.5_pro_test_500.json"
-SAVE_PATH = "grpo_manager_qwen3_tools_optional_tool_v2"
+DATA_PATH = "pqal_question_context_groundtruth.json"
+SAVE_PATH = "grpo_manager_qwen3_tools_optional_tool_0127_1804"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 USE_FROZEN_REASONER = True
 REASONER_MODEL = "Qwen/Qwen3-0.6B"
 REASONER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-REASONER_MAX_NEW_TOKENS = 2048
+REASONER_MAX_NEW_TOKENS = 5000
 
 # Optional: encourage/discourage tool usage (keep your values)
 TOOL_PENALTY = 0.0
-TOOL_CALL_BONUS = 0.3
+TOOL_CALL_BONUS = 0.5
 TOOL_BONUS_ONLY_IF_CORRECT = True
 
 # Added (default 0.0 to keep behavior stable unless you turn it on)
@@ -47,7 +47,7 @@ NO_TOOL_CORRECT_BONUS = 0.0
 
 # Debug log (added)
 DEBUG_JSONL = SAVE_PATH + "_train_debug.jsonl"
-DEBUG_MAX_CHARS = 2048
+DEBUG_MAX_CHARS = 5000
 
 # -----------------------------
 # Global caches
@@ -75,7 +75,12 @@ SYSTEM_PROMPT = (
     "Do NOT output <think>.\n"
 )
 
-ANSWER_LASTLINE_RE = re.compile(r"(?:^|\n)\s*ANSWER_(YES|NO|MAYBE)\s*$", re.IGNORECASE)
+# ANSWER_LASTLINE_RE = re.compile(r"(?:^|\n)\s*ANSWER_(YES|NO|MAYBE)\s*$", re.IGNORECASE)
+
+ANSWER_LASTLINE_RE = re.compile(
+    r"(?:^|\n)\s*ANSWER_(YES|NO|MAYBE)\b[^\w]*$",
+    re.IGNORECASE
+)
 
 def parse_answer_label_lastline(text: str) -> Optional[str]:
     if not text:
@@ -109,13 +114,32 @@ def load_data(path: str) -> Dataset:
         raw = json.load(f)
 
     rows = []
-    for i, ex in enumerate(raw):
-        eid = int(i)
-        q = ex["question"]
-        ctx = ex["context"]
-        gt = ex["ground_truth"].strip().lower()
-        ID2EX[eid] = {"question": q, "context": ctx, "ground_truth": gt}
-        rows.append({"example_id": eid, "question": q, "context": ctx, "ground_truth": gt})
+
+    # Case 1: dict keyed by example_id (e.g., PMID strings)
+    if isinstance(raw, dict):
+        for k, ex in raw.items():
+            eid = int(k)  # use JSON key as example_id
+            q = ex["question"]
+            ctx = ex["context"]
+            gt = ex["ground_truth"].strip().lower()
+
+            ID2EX[eid] = {"question": q, "context": ctx, "ground_truth": gt}
+            rows.append({"example_id": eid, "question": q, "context": ctx, "ground_truth": gt})
+
+    # Case 2: list of examples (old format)
+    elif isinstance(raw, list):
+        for i, ex in enumerate(raw):
+            eid = int(i)  # generated index
+            q = ex["question"]
+            ctx = ex["context"]
+            gt = ex["ground_truth"].strip().lower()
+
+            ID2EX[eid] = {"question": q, "context": ctx, "ground_truth": gt}
+            rows.append({"example_id": eid, "question": q, "context": ctx, "ground_truth": gt})
+
+    else:
+        raise ValueError(f"Unsupported JSON top-level type: {type(raw)}")
+
     return Dataset.from_list(rows)
 
 # -----------------------------
@@ -125,7 +149,7 @@ def load_data(path: str) -> Dataset:
 class FrozenReasoner:
     model_name: str
     device: str = "cpu"
-    max_new_tokens: int = 2048
+    max_new_tokens: int = 5000
 
     def __post_init__(self):
         self.tok = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
@@ -183,7 +207,7 @@ if USE_FROZEN_REASONER:
 # Tool function
 # -----------------------------
 PRINT_TOOL_OUTPUT = True
-TOOL_OUTPUT_MAX_CHARS = 2048
+TOOL_OUTPUT_MAX_CHARS = 10000
 
 def _truncate(text: str, limit: Optional[int]) -> str:
     if limit is None or len(text) <= limit:
@@ -443,7 +467,7 @@ def main():
     grpo_args = GRPOConfig(
         output_dir=SAVE_PATH,
         remove_unused_columns=False,
-        max_completion_length=2048,
+        max_completion_length=5000,
         temperature=0.7,
         num_generations=4,
         bf16=(DEVICE == "cuda"),
