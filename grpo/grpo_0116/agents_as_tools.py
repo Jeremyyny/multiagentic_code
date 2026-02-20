@@ -419,6 +419,11 @@ def build_tool_sft_data_from_splits(
 
     id2ex = {r["example_id"]: r for r in rows}
     teacher = get_teacher_client_from_env() if synth_mode == "gpt" else None
+    if synth_mode == "gpt" and teacher is None:
+        raise ValueError(
+            "synth_mode='gpt' requires TEACHER_BASE_URL and TEACHER_MODEL. "
+            "Set env vars or switch to --tool_synth_mode weak."
+        )
 
     tool_reason_train, tool_reason_dev = [], []
     tool_ctx_train, tool_ctx_dev = [], []
@@ -429,14 +434,26 @@ def build_tool_sft_data_from_splits(
         cand_lines = "\n".join([f"[{c['sid']}] {c['text']}" for c in candidates])
         user = f"QUESTION:\n{q}\n\nCANDIDATE SENTENCES:\n{cand_lines}\n"
         raw = teacher.chat([{"role": "system", "content": REASONING_SYS}, {"role": "user", "content": user}], temperature=0.2)
-        return extract_first_json(raw)
+        obj = extract_first_json(raw)
+        if obj is None:
+            raise ValueError(
+                "GPT synthesis failed for reasoning_tool: response is not valid JSON object. "
+                "Use --tool_synth_mode weak if you want fallback behavior."
+            )
+        return obj
 
     def gpt_make_context(q: str, ctx: str) -> Optional[Dict[str, Any]]:
         if teacher is None:
             return None
         user = f"QUESTION:\n{q}\n\nCONTEXT:\n{ctx}\n"
         raw = teacher.chat([{"role": "system", "content": CONTEXT_SYS}, {"role": "user", "content": user}], temperature=0.2)
-        return extract_first_json(raw)
+        obj = extract_first_json(raw)
+        if obj is None:
+            raise ValueError(
+                "GPT synthesis failed for context_tool: response is not valid JSON object. "
+                "Use --tool_synth_mode weak if you want fallback behavior."
+            )
+        return obj
 
     def normalize_reasoning_obj(obj_r: Dict[str, Any]) -> Dict[str, Any]:
         ev = obj_r.get("evidence", [])
@@ -524,6 +541,8 @@ def build_tool_sft_data_from_splits(
                 obj_r = gpt_make_reasoning(q, candidates)
 
             if obj_r is None:
+                if synth_mode == "gpt":
+                    raise RuntimeError("Unexpected empty reasoning object in strict gpt synthesis mode.")
                 # Weak mode: no label usage, keep polarity unclear
                 ev_items = [{"sid": int(e["sid"]), "text": str(e["text"])[:240], "polarity": "unclear"} for e in evidence[:6]]
                 obj_r = {
@@ -554,6 +573,8 @@ def build_tool_sft_data_from_splits(
                 obj_c = gpt_make_context(q, ctx)
 
             if obj_c is None:
+                if synth_mode == "gpt":
+                    raise RuntimeError("Unexpected empty context object in strict gpt synthesis mode.")
                 key_sentences = [{"sid": int(e["sid"]), "text": str(e["text"])[:240]} for e in evidence[:6]]
                 obj_c = {
                     "key_sentences": key_sentences,
